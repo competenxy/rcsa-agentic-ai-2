@@ -1,0 +1,5 @@
+# .gitignore
+# keep secrets & caches out of git
+.streamlit/secrets.toml
+__pycache__/
+*.pyc

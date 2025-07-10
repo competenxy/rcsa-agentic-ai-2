@@ -1,0 +1,10 @@
+# requirements.txt  – pin only what matters
+streamlit==1.35.0       # UI layer
+openai>=1.30.0          # ChatCompletion API
+pandas>=2.2             # DataFrame & Excel export
+python-docx>=1.1        # DOCX reading
+pdfplumber>=0.10        # PDF text extraction
+docx2txt>=0.8           # fallback DOCX text extractor (optional)
+python-magic-bin>=0.4 ; platform_system=="Windows"
+python-magic>=0.4       ; platform_system!="Windows"
+openpyxl>=3.1  
