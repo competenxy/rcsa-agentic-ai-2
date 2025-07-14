@@ -4,26 +4,13 @@ import json
 import re
 from io import BytesIO
 from openai import OpenAI
-import docx2txt, pdfplumber
+import docx2txt
+import pdfplumber
 
-# ---------------- OpenAI Client ----------------
-client = OpenAI(api_key=st.secrets.get("OPENAI_API_KEY"))
+# Initialize OpenAI client
+client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
-def chat_json(prompt: str, max_tokens: int = 2048) -> dict:
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini",
-        temperature=0.2,
-        max_tokens=max_tokens,
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": "You are a precise Operational Risk assistant for banks."},
-            {"role": "user", "content": prompt},
-        ],
-    )
-    # response_format ensures valid JSON
-    return json.loads(resp.choices[0].message.content)
-
-# ---------------- Text Extraction ----------------
+# Text extraction function
 def extract_text(uploaded) -> str:
     name = uploaded.name.lower()
     if name.endswith('.docx'):
@@ -31,151 +18,170 @@ def extract_text(uploaded) -> str:
     if name.endswith('.pdf'):
         with pdfplumber.open(uploaded) as pdf:
             return "\n".join(page.extract_text() or "" for page in pdf.pages)
-    # txt or others
     return uploaded.read().decode('utf-8', errors='ignore')
 
-# ---------------- Normalizers ----------------
+# GPT Chat helper (not cached to allow reruns)
+def chat_json(prompt: str, max_tokens: int = 4096) -> dict:
+    resp = client.chat.completions.create(
+        model="gpt-4o",
+        temperature=0.2,
+        max_tokens=max_tokens,
+        response_format={"type": "json_object"},
+        messages=[{"role": "system", "content": "You're a precise Operational Risk assistant for banks."},
+                  {"role": "user", "content": prompt}],
+    )
+    return json.loads(resp.choices[0].message.content)
+
+# Normalization helpers
 def norm_type(val: str) -> str:
-    v = val.strip().lower()
-    if v.startswith('p'): return 'Preventive'
-    if v.startswith('d'): return 'Detective'
-    if v.startswith('c'): return 'Corrective'
-    return val.strip().title()
+    return val.strip().capitalize()
 
-def norm_freq(val: str) -> str:
-    m = {
-        'monthly':'Monthly', 'quarterly':'Quarterly',
-        'semi-annual':'Semi-Annual', 'annual':'Annual'
-    }
-    v = val.strip().lower()
-    for k, std in m.items():
-        if k in v: return std
-    return val.strip().title()
+def risk_degree_to_freq(degree: str) -> str:
+    mapping = {'Very High': 'Monthly', 'High': 'Quarterly', 'Medium': 'Semi-Annual', 'Low': 'Annual'}
+    return mapping.get(degree, 'Annual')
 
-# ---------------- Generate Controls ----------------
-KEYWORDS = ["approval","limit","threshold","reconcile","review",
-            "authorise","exception","segregation","dual","signoff","compliance"]
+# Generate RCSA controls
 def generate_controls(text: str, target_n: int) -> pd.DataFrame:
-    # extract relevant sentences
-    parts = re.split(r'[\.\!\?\n]', text)
-    sentences = [s.strip() for s in parts if any(k in s.lower() for k in KEYWORDS) and len(s.strip())>20]
+    keywords = ["approval","limit","threshold","reconcile","review","authorise",
+                "exception","segregation","dual","signoff","compliance","validate","checker"]
+    sentences = [s.strip() for s in re.split(r'[.!?\n]', text)
+                 if any(k in s.lower() for k in keywords) and len(s.strip()) > 20]
+
+    st.info(f"✅ **Identified {len(sentences)} potential control-related sentences.**")
+
     if not sentences:
-        st.warning("No keyword-matched sentences found.")
+        st.warning("No control-like sentences found.")
         return pd.DataFrame()
-    block = "\n".join(sentences)
+
     prompt = f"""
-Extract at least {target_n} specific RCSA controls from the following sentences.
-Each control must be in verb–object–condition format.
-Return a JSON object with key "controls" mapping to an array of objects with keys:
-  ControlID, ControlObjective, Type, TestingMethod, Frequency, RiskLevel, RiskDegree
-Type must be one of Preventive, Detective, Corrective.
-Frequency must be one of Monthly, Quarterly, Semi-Annual, Annual.
+Table 3 - How to craft your own Verb – Object – Condition statements
+Verb – the control action (Approve, Block, Reconcile, Review…).
+Object – the item being controlled (loan, payment file, user ID…).
+Condition – the measurable rule that triggers or defines success (amount, time-limit, frequency, threshold).
+
+Table 4 – List of keywords to look for controls:
+Authorise, Approve, Limit, Threshold, Dual-sign, Maker, Checker, Segregate, Validate, Mandatory, Drop-down, Exception, Queue, Reconcile, Compare, Audit-log,
+Override, Escalate, Lock, Cut-off, Timeout, Alert, Ageing, Suspense, Access, Role, Privilege, Password, Token, MFA, Credential, Entitlement, Change, Release,
+Deploy, Patch, Configuration, Version, Rollback, Backup, Restore, Fail-over, DR, BIA, Resilience, RTO, RPO, Incident, Root-cause, RCA, Report, KCI, KPI, Breach, Loss,
+Vendor, Outsource, Third-party, SLA, Contract, Due-diligence, Onboarding, Performance-review, Payment, Disbursement, Settlement, Clearing, Remittance, Payout,
+Transfer, Transaction-limit, Reconciliation, Break, Unmatched, Mismatch, Exception-ageing, Write-off, Suspense-clear.
+
+Use only the above keywords to identify eligible controls.
+
+Only extract controls that:
+- Follow the strict Verb-Object-Condition format (e.g. “Approve loan request within 2 days”).
+- Include clearly measurable, document-sourced conditions like frequency, thresholds, responsible roles.
+- Each control must contain a verb, an object, and a measurable condition.
+- Do not invent information not present in the document.
+\n\nExtract at least {target_n} specific, measurable RCSA controls in verb-object-condition format from:
 
 Sentences:
-{block}
-"""
-    result = chat_json(prompt, max_tokens=min(4096, target_n*60+200))
-    items = result.get('controls', [])
-    # post-process defaults and normalization
-    for i, item in enumerate(items, start=1):
-        item.setdefault('ControlID', f'GC-{i:03d}')
-        item['ControlObjective'] = item.get('ControlObjective','').strip()
-        item['Type'] = norm_type(item.get('Type',''))
-        item['TestingMethod'] = item.get('TestingMethod','').strip()
-        item['Frequency'] = norm_freq(item.get('Frequency',''))
-        item['RiskLevel'] = item.get('RiskLevel','').strip().title()
-        item['RiskDegree'] = item.get('RiskDegree','').strip().title()
-    return pd.DataFrame(items)
+{sentences}
 
-# ---------------- Validate Controls ----------------
+- Controls must explicitly state measurable conditions (e.g., days, thresholds, approver roles).
+- Controls must only be created using content from the document.
+- Do not merge or summarize similar controls; treat each qualifying sentence separately.
+
+Classify strictly into Level 1 Risk and Level 2 Risk:
+Internal Fraud: Unauthorized activity, Theft and fraud
+External Fraud: Theft and fraud, Systems security
+Employment practices and workplace safety: Employee relations, Safe environment, Diversity and discrimination
+Clients, products and business practices: Suitability, disclosure, fiduciary, Improper business or market practices, Product flaws, Selection, sponsorship and exposure, Advisory activities
+Damage to physical assets: Disasters and other events
+Business disruption and system failures: Systems
+Execution, delivery and process management: Transaction capture, execution and maintenance, Monitoring and reporting, Customer intake and documentation, Customer/client account management, Trade counterparties, Vendors and suppliers
+If unclear, mark as 'Other'.
+
+Assign Risk Degree explicitly based on severity clearly:
+- Very High: Immediate significant financial or regulatory impact, critical systems/processes.
+- High: Significant financial/regulatory impact, important client impacts, or critical operational activities.
+- Medium: Moderate financial/regulatory/client impacts, operationally important but not critical.
+- Low: Minimal financial/regulatory impact, routine or low significance processes.
+
+Return JSON array exactly with keys:
+ControlID, ControlObjective, Level1Risk, Level2Risk, RiskDegree (Very High, High, Medium, Low), Type (Preventive, Detective, Corrective), TestingMethod."""
+
+    data = chat_json(prompt)
+    controls = data.get('controls', [])
+
+    for idx, ctrl in enumerate(controls, 1):
+        ctrl['ControlID'] = ctrl.get('ControlID', f'GC-{idx:03d}')
+        ctrl['Type'] = norm_type(ctrl['Type'])
+        ctrl['Frequency'] = risk_degree_to_freq(ctrl['RiskDegree'])
+
+    return pd.DataFrame(controls)
+
+# Validate existing RCSA controls
 def validate_controls(raw_text: str) -> pd.DataFrame:
     lines = [l.strip() for l in raw_text.splitlines() if l.strip()]
-    if not lines:
-        st.warning("No controls found in the uploaded file.")
-        return pd.DataFrame()
-    block = "\n".join(lines)
-    prompt = f"""
-Rewrite each of the following RCSA controls in clear verb–object–condition form.
-Return a JSON object with key "controls" mapping to an array of objects with keys:
-  OldControlObjective, UpdatedControlObjective, Type, TestingMethod, Frequency, RiskLevel, RiskDegree
-Type must be Preventive, Detective, or Corrective.
-Frequency must be Monthly, Quarterly, Semi-Annual, or Annual.
 
-Controls:
-{block}
-"""
-    result = chat_json(prompt, max_tokens=min(4096, len(lines)*60+200))
-    items = result.get('controls', [])
-    # post-process
-    for idx, item in enumerate(items, start=1):
-        item.setdefault('OldControlObjective', lines[idx-1])
-        item.setdefault('ControlID', f'VC-{idx:03d}')
-        item['UpdatedControlObjective'] = item.get('UpdatedControlObjective','').strip()
-        item['Type'] = norm_type(item.get('Type',''))
-        item['TestingMethod'] = item.get('TestingMethod','').strip()
-        item['Frequency'] = norm_freq(item.get('Frequency',''))
-        item['RiskLevel'] = item.get('RiskLevel','').strip().title()
-        item['RiskDegree'] = item.get('RiskDegree','').strip().title()
-    df = pd.DataFrame(items)
-    # preserve row count
-    if len(df) < len(lines):
-        for i in range(len(df), len(lines)):
-            df = pd.concat([df, pd.DataFrame([{
-                'OldControlObjective': lines[i],
-                'UpdatedControlObjective': 'REVIEW_NEEDED',
-                'Type':'REVIEW_NEEDED', 'TestingMethod':'', 'Frequency':'',
-                'RiskLevel':'', 'RiskDegree':''
-            }])], ignore_index=True)
-    elif len(df) > len(lines):
-        df = df.iloc[:len(lines)].reset_index(drop=True)
-    return df[[
-        'OldControlObjective','UpdatedControlObjective',
-        'Type','TestingMethod','Frequency','RiskLevel','RiskDegree'
-    ]]
+    prompt = f"""Rewrite these RCSA controls explicitly in measurable verb-object-condition format, discarding vague ones:
 
-# ---------------- Excel Download ----------------
-def download_excel(df: pd.DataFrame, filename: str):
-    buf = BytesIO()
-    df.to_excel(buf, index=False)
-    st.download_button("📥 Download Excel", buf.getvalue(), file_name=filename,
-                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+{lines}
 
-# ---------------- Streamlit UI ----------------
+Classify strictly into Level 1 Risk and Level 2 Risk:
+Internal Fraud: Unauthorized activity, Theft and fraud
+External Fraud: Theft and fraud, Systems security
+Employment practices and workplace safety: Employee relations, Safe environment, Diversity and discrimination
+Clients, products and business practices: Suitability, disclosure, fiduciary, Improper business or market practices, Product flaws, Selection, sponsorship and exposure, Advisory activities
+Damage to physical assets: Disasters and other events
+Business disruption and system failures: Systems
+Execution, delivery and process management: Transaction capture, execution and maintenance, Monitoring and reporting, Customer intake and documentation, Customer/client account management, Trade counterparties, Vendors and suppliers
+If unclear, mark as 'Other'.
+
+Assign Risk Degree explicitly based on severity clearly:
+- Very High: Immediate significant financial or regulatory impact, critical systems/processes.
+- High: Significant financial/regulatory impact, important client impacts, or critical operational activities.
+- Medium: Moderate financial/regulatory/client impacts, operationally important but not critical.
+- Low: Minimal financial/regulatory impact, routine or low significance processes.
+
+Return JSON array exactly with keys:
+ControlID, OldControlObjective, UpdatedControlObjective, Level1Risk, Level2Risk, RiskDegree, Type, TestingMethod."""
+
+    data = chat_json(prompt)
+    controls = data.get('controls', [])
+
+    for ctrl in controls:
+        ctrl['Type'] = norm_type(ctrl['Type'])
+        ctrl['Frequency'] = risk_degree_to_freq(ctrl['RiskDegree'])
+
+    return pd.DataFrame(controls)
+
+# Streamlit UI setup
 st.set_page_config(page_title="RCSA Agentic AI", layout="wide")
 st.title("📋 RCSA Agentic AI")
-tabs = st.tabs(["🆕 Generate RCSA","🛠️ Validate RCSA"])
 
-with tabs[0]:
-    st.subheader("Generate draft controls from a policy/SOP")
-    up = st.file_uploader("Upload PDF, DOCX, or TXT", type=["pdf","docx","txt"])
-    tgt = st.number_input("Target number of controls", 1, 100, 20)
-    if st.button("Generate controls"):
-        if up:
-            text = extract_text(up)
-            df_out = generate_controls(text, tgt)
-            if not df_out.empty:
-                st.dataframe(df_out, use_container_width=True)
-                download_excel(df_out, "generated_controls.xlsx")
-        else:
-            st.warning("Please upload a file first.")
+new_tab, validate_tab = st.tabs(["🆕 Generate New Controls", "🛠️ Validate Controls"])
 
-with tabs[1]:
-    st.subheader("Validate / clean an existing control list")
-    up2 = st.file_uploader("Upload CSV, XLSX, DOCX, PDF, or TXT", type=["csv","xlsx","docx","pdf","txt"])
-    if st.button("Validate controls"):
-        if up2:
-            name = up2.name.lower()
-            if name.endswith(".csv"):
-                df_in = pd.read_csv(up2)
-                raw = "\n".join(df_in.iloc[:,0].astype(str).tolist())
-            elif name.endswith((".xlsx",".xls")):
-                df_in = pd.read_excel(up2)
-                raw = "\n".join(df_in.iloc[:,0].astype(str).tolist())
-            else:
-                raw = extract_text(up2)
-            df_valid = validate_controls(raw)
-            if not df_valid.empty:
-                st.dataframe(df_valid, use_container_width=True)
-                download_excel(df_valid, "validated_controls.xlsx")
-        else:
-            st.warning("Please upload a file first.")
+# Generate Controls Tab
+with new_tab:
+    st.subheader("Generate RCSA Controls")
+    uploaded = st.file_uploader("Upload document (PDF, DOCX, TXT)", type=["pdf","docx","txt"])
+    target_n = st.number_input("Target Number of Controls", min_value=1, max_value=100, value=10)
+
+    if st.button("Generate", key="generate_btn") and uploaded:
+        text = extract_text(uploaded)
+        df_out = generate_controls(text, target_n)
+        if not df_out.empty:
+            st.dataframe(df_out, use_container_width=True)
+            buffer = BytesIO()
+            df_out.to_excel(buffer, index=False)
+            st.download_button("📥 Download Excel", buffer.getvalue(), file_name="generated_controls.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+# Validate Controls Tab
+with validate_tab:
+    st.subheader("Validate Existing RCSA Controls")
+    uploaded_existing = st.file_uploader("Upload existing RCSA (CSV, XLSX)", type=["csv","xlsx"])
+
+    if st.button("Validate", key="validate_btn") and uploaded_existing:
+        df_existing = pd.read_csv(uploaded_existing) if uploaded_existing.name.endswith('.csv') else pd.read_excel(uploaded_existing)
+        col = next((c for c in ['ControlObjective', 'Control Objective'] if c in df_existing.columns), df_existing.columns[1])
+        raw_text = "\n".join(df_existing[col].astype(str).tolist())
+        df_validated = validate_controls(raw_text)
+        if not df_validated.empty:
+            st.dataframe(df_validated, use_container_width=True)
+            buffer = BytesIO()
+            df_validated.to_excel(buffer, index=False)
+            st.download_button("📥 Download Validated Excel", buffer.getvalue(), file_name="validated_controls.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
